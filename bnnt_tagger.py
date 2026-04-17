@@ -247,11 +247,23 @@ else:
     _cli_abs     = None
     _initial_dir = os.getcwd()
 
-folder_input = pn.widgets.TextInput(name='Folder:', value=_initial_dir, sizing_mode='stretch_width', height=30)
-file_select  = pn.widgets.Select(name='File:', value='', options=[''], sizing_mode='stretch_width')
-refresh_btn  = pn.widgets.Button(name='↺  Refresh', button_type='default', width=100, height=30)
-load_btn     = pn.widgets.Button(name='▶  Load',    button_type='success',  width=100, height=30)
-load_status  = pn.pane.HTML(
+def _dir_status_html(path):
+    ok = os.path.isdir(path.strip()) if path.strip() else False
+    return ('<span style="color:green;font-size:13px;line-height:30px">✔</span>'
+            if ok else
+            '<span style="color:#ccc;font-size:13px;line-height:30px">✗</span>')
+
+folder_input      = pn.widgets.TextInput(name='Input folder:', value=_initial_dir,
+                                         sizing_mode='stretch_width', height=30)
+folder_status     = pn.pane.HTML(_dir_status_html(_initial_dir), width=18)
+file_select       = pn.widgets.Select(name='File:', value='', options=[''],
+                                      sizing_mode='stretch_width')
+refresh_btn       = pn.widgets.Button(name='↺', button_type='default', width=36, height=30)
+load_btn          = pn.widgets.Button(name='▶  Load', button_type='success', width=100, height=30)
+out_dir_input     = pn.widgets.TextInput(name='Output folder:', value=_initial_dir,
+                                         sizing_mode='stretch_width', height=30)
+out_dir_status    = pn.pane.HTML(_dir_status_html(_initial_dir), width=18)
+load_status       = pn.pane.HTML(
     '<span style="color:#aaa;font-size:12px">No file loaded.</span>',
     sizing_mode='stretch_width',
 )
@@ -267,7 +279,15 @@ def refresh_file_list(folder=None):
         file_select.options = ['(no .txt / .gwy files found)']
         file_select.value   = file_select.options[0]
 
-folder_input.param.watch(lambda e: refresh_file_list(e.new), 'value')
+def _on_folder_change(e):
+    folder_status.object = _dir_status_html(e.new)
+    refresh_file_list(e.new)
+
+def _on_out_dir_change(e):
+    out_dir_status.object = _dir_status_html(e.new)
+
+folder_input.param.watch(_on_folder_change, 'value')
+out_dir_input.param.watch(_on_out_dir_change, 'value')
 refresh_btn.on_click(lambda _e: refresh_file_list())
 
 refresh_file_list(_initial_dir)
@@ -589,6 +609,9 @@ def load_file(fp):
     _file_dir    = os.path.dirname(os.path.abspath(fp))
     _file_stem   = os.path.splitext(os.path.basename(fp))[0]
 
+    folder_input.value    = _file_dir
+    out_dir_input.value   = _file_dir
+
     _tag_mode    = 'cycle'
     _block_tubes = 4
     cycle_input.value        = ', '.join(DEFAULT_CYCLE)
@@ -831,7 +854,7 @@ dist_btn.on_click(on_dist)
 # ── Export CSV ─────────────────────────────────────────────────────────────────
 
 def on_export(_event):
-    out = os.path.join(_file_dir, _file_stem + '_tagged_profiles.csv')
+    out = os.path.join(out_dir_input.value.strip() or _file_dir, _file_stem + '_tagged_profiles.csv')
     with open(out, 'w', newline='') as f:
         w = csv.writer(f)
         w.writerow(['line_index', 'bnnt', 'tag', 'distance_um', 'height_nm'])
@@ -870,10 +893,11 @@ def on_save_plots(_event):
         )
         return
     saved = []
+    _out_dir = out_dir_input.value.strip() or _file_dir
 
     for tag, entries in _profile_data:
         slug = tag.replace(' ', '_')
-        out  = os.path.join(_file_dir, f'{_file_stem}_profile_{slug}.png')
+        out  = os.path.join(_out_dir, f'{_file_stem}_profile_{slug}.png')
         fig, ax = plt.subplots(figsize=(6, 4))
         for j, (bnnt, d, p) in enumerate(entries):
             ax.plot(d, p, color=PLOT_COLORS[j % len(PLOT_COLORS)],
@@ -890,7 +914,7 @@ def on_save_plots(_event):
 
     for tag, values, x_label, n_bins in _dist_data:
         slug = tag.replace(' ', '_')
-        out  = os.path.join(_file_dir, f'{_file_stem}_dist_{slug}.png')
+        out  = os.path.join(_out_dir, f'{_file_stem}_dist_{slug}.png')
         hist, edges = np.histogram(values, bins=n_bins)
         fig, ax = plt.subplots(figsize=(6, 4))
         ax.bar(edges[:-1], hist, width=np.diff(edges), align='edge',
@@ -918,11 +942,17 @@ save_plots_btn.on_click(on_save_plots)
 # ── Layout assembly ────────────────────────────────────────────────────────────
 
 file_browser_section = pn.Card(
-    pn.Row(folder_input, pn.Column(pn.Spacer(height=20), refresh_btn), sizing_mode='stretch_width'),
+    pn.Row(folder_input, folder_status,
+           pn.Column(pn.Spacer(height=20), refresh_btn),
+           sizing_mode='stretch_width', align='end'),
     pn.Spacer(height=4),
-    pn.Row(file_select,  pn.Column(pn.Spacer(height=20), load_btn), sizing_mode='stretch_width'),
+    pn.Row(file_select,
+           pn.Column(pn.Spacer(height=20), load_btn),
+           sizing_mode='stretch_width'),
     pn.Spacer(height=4),
     load_status,
+    pn.Spacer(height=6),
+    pn.Row(out_dir_input, out_dir_status, sizing_mode='stretch_width', align='end'),
     title='📂  File',
     collapsible=False,
     header_background='#f5f5f5',
