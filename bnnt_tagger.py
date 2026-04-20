@@ -14,6 +14,7 @@ import sys, os, csv, re
 import numpy as np
 import pandas as pd
 from scipy.ndimage import map_coordinates
+from scipy.signal import find_peaks
 import gwyfile
 
 import panel as pn
@@ -49,7 +50,7 @@ _CSS = """
 .tabulator .tabulator-col-title { font-size: 11px !important; }
 """
 
-pn.extension('bokeh', 'tabulator', notifications=True, sizing_mode='stretch_width', raw_css=[_CSS])
+pn.extension('tabulator', notifications=True, sizing_mode='stretch_width', raw_css=[_CSS])
 
 # ── Configuration ──────────────────────────────────────────────────────────────
 
@@ -161,6 +162,42 @@ def compute_metric(tag, distances, heights):
     return float(d[-1]) * 1000 if tag == 'longitudinal' else float(np.max(h))
 
 
+def analyze_longitudinal(prof_idx, baseline_pct, prominence_pct, min_dist):
+    """
+    Detect peaks and valleys in a longitudinal profile.
+    Returns corrected profile (baseline shifted to 0) plus peak/valley info.
+    """
+    d, h    = profiles[prof_idx]
+    d_nm    = np.array(d) * 1000        # µm → nm
+    h_arr   = np.array(h)
+
+    # Baseline: minimum or percentile
+    baseline = (float(np.percentile(h_arr, baseline_pct))
+                if baseline_pct > 0 else float(h_arr.min()))
+    h_corr  = h_arr - baseline
+    h_range = float(h_corr.max()) - float(h_corr.min())
+
+    prom     = max(0.0, prominence_pct / 100.0 * h_range)
+    dist_arg = max(1, int(min_dist))
+
+    pk_idx, pk_props = find_peaks(h_corr, prominence=prom, distance=dist_arg)
+    # valleys = peaks on inverted signal; use half the peak prominence
+    vl_idx, vl_props = find_peaks(-h_corr, prominence=max(0.0, prom * 0.5),
+                                  distance=dist_arg)
+
+    peaks = dict(
+        pos        = d_nm[pk_idx].tolist(),
+        height     = h_corr[pk_idx].tolist(),
+        prominence = pk_props['prominences'].tolist(),
+    )
+    valleys = dict(
+        pos        = d_nm[vl_idx].tolist(),
+        height     = h_corr[vl_idx].tolist(),
+        prominence = vl_props['prominences'].tolist(),
+    )
+    return d_nm.tolist(), h_corr.tolist(), baseline, peaks, valleys
+
+
 def arrange_rows(figs, n_cols=2):
     rows = []
     for i in range(0, len(figs), n_cols):
@@ -205,11 +242,14 @@ def parse_cycle_text(text):
         return None, f"Unknown tag(s): {', '.join(invalid)}"
     return parts, None
 
-def list_data_files(folder):
+def _get_subdirs(folder):
     try:
-        return sorted(f for f in os.listdir(folder)
-                      if f.lower().endswith(('.txt', '.gwy')))
-    except Exception:
+        return sorted(
+            [e.name for e in os.scandir(folder)
+             if e.is_dir() and not e.name.startswith('.')],
+            key=str.lower,
+        )
+    except (PermissionError, OSError):
         return []
 
 # ── Mutable application state ──────────────────────────────────────────────────
@@ -237,7 +277,7 @@ line_source  = ColumnDataSource(data=dict(
 ))
 label_source = ColumnDataSource(data=dict(x=[], y=[], text=[]))
 
-# ── File browser ───────────────────────────────────────────────────────────────
+# ── CLI args ───────────────────────────────────────────────────────────────────
 
 _cli_args = [a for a in sys.argv[1:] if not a.startswith('--')]
 if _cli_args:
@@ -247,54 +287,114 @@ else:
     _cli_abs     = None
     _initial_dir = os.getcwd()
 
-def _dir_status_html(path):
-    ok = os.path.isdir(path.strip()) if path.strip() else False
-    return ('<span style="color:green;font-size:13px;line-height:30px">✔</span>'
-            if ok else
-            '<span style="color:#ccc;font-size:13px;line-height:30px">✗</span>')
+# ── Input file browser ─────────────────────────────────────────────────────────
 
-folder_input      = pn.widgets.TextInput(name='Input folder:', value=_initial_dir,
-                                         sizing_mode='stretch_width', height=30)
-folder_status     = pn.pane.HTML(_dir_status_html(_initial_dir), width=18)
-file_select       = pn.widgets.Select(name='File:', value='', options=[''],
-                                      sizing_mode='stretch_width')
-refresh_btn       = pn.widgets.Button(name='↺', button_type='default', width=36, height=30)
-load_btn          = pn.widgets.Button(name='▶  Load', button_type='success', width=100, height=30)
-out_dir_input     = pn.widgets.TextInput(name='Output folder:', value=_initial_dir,
-                                         sizing_mode='stretch_width', height=30)
-out_dir_status    = pn.pane.HTML(_dir_status_html(_initial_dir), width=18)
-load_status       = pn.pane.HTML(
+_in_nav_dir = [_initial_dir]
+
+def _get_browser_items(folder):
+    items = []
+    try:
+        entries = sorted(os.scandir(folder),
+                         key=lambda e: (not e.is_dir(), e.name.lower()))
+        for e in entries:
+            if e.is_dir() and not e.name.startswith('.'):
+                items.append('📁 ' + e.name)
+            elif e.is_file() and e.name.lower().endswith(('.gwy', '.txt')):
+                items.append('📄 ' + e.name)
+    except (PermissionError, OSError):
+        pass
+    return items
+
+in_nav_path_html = pn.pane.HTML('', sizing_mode='stretch_width')
+in_nav_list      = pn.widgets.MultiSelect(
+    name='', options=[], height=130, sizing_mode='stretch_width',
+)
+in_nav_up_btn    = pn.widgets.Button(name='↑ Up',    width=70, height=26)
+in_nav_enter_btn = pn.widgets.Button(name='↓ Enter', width=80, height=26)
+
+def _refresh_in_nav(folder=None):
+    d = folder or _in_nav_dir[0]
+    _in_nav_dir[0] = d
+    label = d if len(d) <= 46 else '…' + d[-44:]
+    in_nav_path_html.object = (
+        f'<span style="font-size:11px;color:#444;word-break:break-all">'
+        f'📁 <b>{label}</b></span>'
+    )
+    items = _get_browser_items(d)
+    in_nav_list.options = items if items else ['(empty)']
+
+def _on_in_up(_event):
+    parent = os.path.dirname(_in_nav_dir[0])
+    if parent and parent != _in_nav_dir[0]:
+        _refresh_in_nav(parent)
+
+def _on_in_enter(_event):
+    sel = in_nav_list.value
+    if not sel or sel[0] == '(empty)':
+        return
+    item = sel[0]
+    if item.startswith('📁 '):
+        new = os.path.join(_in_nav_dir[0], item[2:])
+        if os.path.isdir(new):
+            _refresh_in_nav(new)
+
+in_nav_up_btn.on_click(_on_in_up)
+in_nav_enter_btn.on_click(_on_in_enter)
+_refresh_in_nav()
+
+load_btn = pn.widgets.Button(
+    name='▶  Load selected', button_type='success',
+    sizing_mode='stretch_width', height=30,
+)
+load_status = pn.pane.HTML(
     '<span style="color:#aaa;font-size:12px">No file loaded.</span>',
     sizing_mode='stretch_width',
 )
 
-def refresh_file_list(folder=None):
-    folder = (folder or folder_input.value).strip()
-    files  = list_data_files(folder)
-    if files:
-        file_select.options = files
-        if file_select.value not in files:
-            file_select.value = files[0]
-    else:
-        file_select.options = ['(no .txt / .gwy files found)']
-        file_select.value   = file_select.options[0]
+# Pre-navigate to CLI file's directory if given
+if _cli_abs and os.path.isfile(_cli_abs):
+    _refresh_in_nav(os.path.dirname(_cli_abs))
 
-def _on_folder_change(e):
-    folder_status.object = _dir_status_html(e.new)
-    refresh_file_list(e.new)
+# ── Output directory browser ───────────────────────────────────────────────────
 
-def _on_out_dir_change(e):
-    out_dir_status.object = _dir_status_html(e.new)
+_out_dir = [_initial_dir]  # mutable container
 
-folder_input.param.watch(_on_folder_change, 'value')
-out_dir_input.param.watch(_on_out_dir_change, 'value')
-refresh_btn.on_click(lambda _e: refresh_file_list())
+out_dir_path_html = pn.pane.HTML('', sizing_mode='stretch_width')
+out_dir_sublist   = pn.widgets.MultiSelect(
+    name='Subdirectories:',
+    options=[],
+    height=80,
+    sizing_mode='stretch_width',
+)
+out_nav_up_btn    = pn.widgets.Button(name='↑ Up',    width=70,  height=26)
+out_nav_enter_btn = pn.widgets.Button(name='↓ Enter', width=80,  height=26)
 
-refresh_file_list(_initial_dir)
-if _cli_abs:
-    fname = os.path.basename(_cli_abs)
-    if fname in file_select.options:
-        file_select.value = fname
+def _refresh_out_nav(folder=None):
+    d = folder or _out_dir[0]
+    _out_dir[0] = d
+    label = d if len(d) <= 48 else '…' + d[-46:]
+    out_dir_path_html.object = (
+        f'<span style="font-size:11px;color:#444;word-break:break-all">'
+        f'📁 <b>{label}</b></span>'
+    )
+    subdirs = _get_subdirs(d)
+    out_dir_sublist.options = subdirs if subdirs else ['(no subdirectories)']
+
+def _on_out_up(_event):
+    parent = os.path.dirname(_out_dir[0])
+    if parent and parent != _out_dir[0]:
+        _refresh_out_nav(parent)
+
+def _on_out_enter(_event):
+    sel = out_dir_sublist.value
+    if sel and sel[0] != '(no subdirectories)':
+        new = os.path.join(_out_dir[0], sel[0])
+        if os.path.isdir(new):
+            _refresh_out_nav(new)
+
+out_nav_up_btn.on_click(_on_out_up)
+out_nav_enter_btn.on_click(_on_out_enter)
+_refresh_out_nav()
 
 # ── GWY helper functions ───────────────────────────────────────────────────────
 
@@ -474,6 +574,264 @@ _dist_figs    = []
 _profile_data = []
 _dist_data    = []
 
+# ── Single profile plot ────────────────────────────────────────────────────────
+
+single_select   = pn.widgets.Select(
+    name='Single profile:',
+    options=[],
+    sizing_mode='stretch_width',
+    disabled=True,
+)
+plot_single_btn = pn.widgets.Button(
+    name='📈  Plot selected',
+    button_type='primary',
+    disabled=True,
+    height=30,
+    width=150,
+)
+single_plot_section = pn.Column(visible=False)
+
+def _make_single_options():
+    return [f'Profile {i+1}  —  {tags[i]}  —  BNNT {bnnts[i]}'
+            for i in range(n_lines)]
+
+def on_plot_single(_event):
+    sel = single_select.value
+    if not sel:
+        return
+    # parse "Profile N  —  tag  —  BNNT M"
+    try:
+        idx = int(sel.split('—')[0].replace('Profile', '').strip()) - 1
+    except (ValueError, IndexError):
+        return
+    if idx < 0 or idx >= n_lines:
+        return
+    d, p   = profiles[idx]
+    d_nm   = [x * 1000 for x in d]
+    tag_str = tags[idx]
+    bnnt_v  = bnnts[idx]
+    color   = TAG_COLORS.get(tag_str, '#1f77b4')
+
+    pf = figure(
+        width=700, height=350,
+        title=f'Profile {idx+1}  ·  {tag_str}  ·  BNNT {bnnt_v}',
+        x_axis_label='Distance (nm)',
+        y_axis_label='Height (nm)',
+        tools='pan,wheel_zoom,reset,save',
+        toolbar_location='above',
+    )
+    pf.line(d_nm, p, line_color=color, line_width=2)
+    pf.title.text_font_size = '12px'
+    pf.grid.grid_line_alpha = 0.25
+    single_plot_section.objects = [
+        pn.pane.HTML('<b style="font-size:13px">Single profile:</b>'),
+        pn.pane.Bokeh(pf, sizing_mode='stretch_width'),
+    ]
+    single_plot_section.visible = True
+
+plot_single_btn.on_click(on_plot_single)
+
+# ── Longitudinal peak / valley analysis ───────────────────────────────────────
+
+long_select = pn.widgets.Select(
+    name='Longitudinal profile:',
+    options=[], sizing_mode='stretch_width', disabled=True,
+)
+baseline_pct_input = pn.widgets.FloatInput(
+    name='Baseline percentile (0 = min):', value=0.0,
+    start=0.0, end=50.0, step=1.0, width=195,
+)
+prominence_pct_input = pn.widgets.FloatInput(
+    name='Min prominence (% of range):', value=10.0,
+    start=0.0, end=100.0, step=1.0, width=195,
+)
+min_dist_input = pn.widgets.IntInput(
+    name='Min distance (samples):', value=5, start=1, step=1, width=140,
+)
+analyze_btn = pn.widgets.Button(
+    name='🔍  Detect peaks & valleys',
+    button_type='primary', disabled=True,
+    sizing_mode='stretch_width', height=30,
+)
+analysis_status  = pn.pane.HTML('', sizing_mode='stretch_width')
+analysis_section = pn.Column(visible=False, sizing_mode='stretch_width')
+
+
+def _make_dist_fig(vals, color, title, x_label, width=370, height=270):
+    arr = np.array(vals)
+    if arr.size == 0:
+        return None
+    n_b = max(5, int(np.ceil(np.log2(len(arr))) + 1))
+    hist, edges = np.histogram(arr, bins=n_b)
+    xpad = (edges[-1] - edges[0]) * 0.08 if edges[-1] != edges[0] else 0.5
+    df = figure(
+        width=width, height=height, title=title,
+        x_axis_label=x_label, y_axis_label='Count',
+        x_range=Range1d(edges[0] - xpad, edges[-1] + xpad),
+        y_range=Range1d(0, float(hist.max()) * 1.20),
+        tools='pan,wheel_zoom,reset,save', toolbar_location='above',
+    )
+    df.title.text_font_size  = '11px'
+    df.grid.grid_line_alpha  = 0.25
+    df.xgrid.grid_line_color = None
+    df.quad(
+        top=hist.tolist(), bottom=[0] * len(hist),
+        left=edges[:-1].tolist(), right=edges[1:].tolist(),
+        fill_color=color, fill_alpha=0.75,
+        line_color='white', line_width=1,
+    )
+    df.add_layout(Label(
+        x=float(edges[-1]) + xpad * 0.3,
+        y=float(hist.max()) * 1.06,
+        text=f'n = {len(arr)}',
+        text_font_size='9pt', text_color='#555', text_align='right',
+    ))
+    return df
+
+
+def on_analyze(_event):
+    sel = long_select.value
+    if not sel:
+        return
+    try:
+        idx = int(sel.split('—')[0].replace('Profile', '').strip()) - 1
+    except (ValueError, IndexError):
+        return
+    if idx < 0 or idx >= n_lines:
+        return
+
+    bpct = baseline_pct_input.value
+    ppct = prominence_pct_input.value
+    mdist = min_dist_input.value
+
+    d_nm, h_corr, baseline, peaks, valleys = analyze_longitudinal(
+        idx, baseline_pct=bpct, prominence_pct=ppct, min_dist=mdist,
+    )
+
+    # ── Individual profile plot with markers ──────────────────────────────
+    pf = figure(
+        width=700, height=320,
+        title=(f'Profile {idx+1}  ·  BNNT {bnnts[idx]}'
+               f'  ·  baseline = {baseline:.2f} nm'),
+        x_axis_label='Distance (nm)',
+        y_axis_label='Height above baseline (nm)',
+        tools='pan,wheel_zoom,reset,save',
+        toolbar_location='above',
+    )
+    pf.title.text_font_size = '11px'
+    pf.grid.grid_line_alpha = 0.25
+    pf.line(d_nm, h_corr, line_color='#1f77b4', line_width=2,
+            legend_label='Profile')
+    pf.line([d_nm[0], d_nm[-1]], [0, 0],
+            line_color='#888', line_width=1, line_dash='dashed',
+            legend_label='Baseline')
+    if peaks['pos']:
+        pf.scatter(peaks['pos'], peaks['height'], marker='triangle',
+                   size=11, color='#d62728', legend_label='Peaks')
+    if valleys['pos']:
+        pf.scatter(valleys['pos'], valleys['height'], marker='inverted_triangle',
+                   size=11, color='#2ca02c', legend_label='Valleys')
+    pf.legend.label_text_font_size = '8pt'
+    pf.legend.location             = 'top_right'
+
+    # ── Individual tables ─────────────────────────────────────────────────
+    pk_df = pd.DataFrame({
+        '#':               range(1, len(peaks['pos']) + 1),
+        'Position (nm)':   [f'{v:.1f}' for v in peaks['pos']],
+        'Height (nm)':     [f'{v:.2f}' for v in peaks['height']],
+        'Prominence (nm)': [f'{v:.2f}' for v in peaks['prominence']],
+    })
+    vl_df = pd.DataFrame({
+        '#':               range(1, len(valleys['pos']) + 1),
+        'Position (nm)':   [f'{v:.1f}' for v in valleys['pos']],
+        'Height (nm)':     [f'{v:.2f}' for v in valleys['height']],
+        'Prominence (nm)': [f'{v:.2f}' for v in valleys['prominence']],
+    })
+    pk_table = pn.widgets.Tabulator(
+        pk_df, width=390, height=150, show_index=False, disabled=True,
+    )
+    vl_table = pn.widgets.Tabulator(
+        vl_df, width=390, height=150, show_index=False, disabled=True,
+    )
+
+    # ── Individual single-profile distributions ───────────────────────────
+    single_dist_figs = []
+    for vals, color, title in [
+        (peaks['height'],   '#d62728', 'Peak heights — this profile'),
+        (valleys['height'], '#2ca02c', 'Valley heights — this profile'),
+    ]:
+        fig = _make_dist_fig(vals, color, title, 'Height above baseline (nm)')
+        if fig:
+            single_dist_figs.append(fig)
+
+    # ── Aggregate: all longitudinal profiles ─────────────────────────────
+    long_indices = [i for i in range(n_lines) if tags[i] == 'longitudinal']
+    all_pk_heights, all_pk_proms = [], []
+    all_vl_heights, all_vl_proms = [], []
+    for li in long_indices:
+        _, _, _, pk_i, vl_i = analyze_longitudinal(
+            li, baseline_pct=bpct, prominence_pct=ppct, min_dist=mdist,
+        )
+        all_pk_heights.extend(pk_i['height'])
+        all_pk_proms.extend(pk_i['prominence'])
+        all_vl_heights.extend(vl_i['height'])
+        all_vl_proms.extend(vl_i['prominence'])
+
+    agg_figs = []
+    for vals, color, title, xlabel in [
+        (all_pk_heights, '#d62728', 'Peak heights — all longitudinals',      'Height above baseline (nm)'),
+        (all_vl_heights, '#2ca02c', 'Valley heights — all longitudinals',    'Height above baseline (nm)'),
+        (all_pk_proms,   '#e07070', 'Peak prominence — all longitudinals',   'Prominence (nm)'),
+        (all_vl_proms,   '#70c070', 'Valley prominence — all longitudinals', 'Prominence (nm)'),
+    ]:
+        fig = _make_dist_fig(vals, color, title, xlabel)
+        if fig:
+            agg_figs.append(fig)
+
+    n_long = len(long_indices)
+    analysis_status.object = (
+        f'<span style="color:green">✔ '
+        f'Selected: <b>{len(peaks["pos"])} peaks</b>, <b>{len(valleys["pos"])} valleys</b>  |  '
+        f'All {n_long} longitudinals: '
+        f'<b>{len(all_pk_heights)} peaks</b>, <b>{len(all_vl_heights)} valleys</b></span>'
+    )
+
+    section_objects = [
+        pn.pane.HTML('<hr style="border-color:#e0e0e0;margin:8px 0">'),
+        pn.pane.HTML('<b style="font-size:13px">Longitudinal peak/valley analysis</b>'),
+        pn.Spacer(height=6),
+        pn.pane.Bokeh(pf, sizing_mode='stretch_width'),
+        pn.Spacer(height=10),
+        pn.Row(
+            pn.Column(pn.pane.HTML(
+                '<b style="font-size:12px;color:#d62728">▲ Peaks</b>'), pk_table),
+            pn.Spacer(width=20),
+            pn.Column(pn.pane.HTML(
+                '<b style="font-size:12px;color:#2ca02c">▼ Valleys</b>'), vl_table),
+        ),
+    ]
+    if single_dist_figs:
+        section_objects += [
+            pn.Spacer(height=10),
+            pn.pane.HTML('<b style="font-size:12px">Distributions — selected profile</b>'),
+            pn.Row(*[pn.pane.Bokeh(f) for f in single_dist_figs]),
+        ]
+    if agg_figs:
+        section_objects += [
+            pn.Spacer(height=14),
+            pn.pane.HTML(
+                f'<b style="font-size:12px">Distributions — all {n_long} longitudinal profiles</b>'
+            ),
+            pn.Row(*[pn.pane.Bokeh(f) for f in agg_figs[:2]]),
+            pn.Row(*[pn.pane.Bokeh(f) for f in agg_figs[2:]]),
+        ]
+
+    analysis_section.objects = section_objects
+    analysis_section.visible = True
+
+
+analyze_btn.on_click(on_analyze)
+
 # ── Profile summary table ──────────────────────────────────────────────────────
 
 profile_table = pn.widgets.Tabulator(
@@ -523,6 +881,21 @@ def update_profile_table():
     })
     table_cycle_header.object = _cycle_header_html()
     table_section.visible = (n_lines > 0)
+    # update single profile select
+    opts = _make_single_options()
+    single_select.options    = opts
+    single_select.value      = opts[0] if opts else None
+    single_select.disabled   = not opts
+    plot_single_btn.disabled = not opts
+    # update longitudinal analysis select
+    long_opts = [
+        f'Profile {i+1}  —  BNNT {bnnts[i]}'
+        for i in range(n_lines) if tags[i] == 'longitudinal'
+    ]
+    long_select.options    = long_opts
+    long_select.value      = long_opts[0] if long_opts else None
+    long_select.disabled   = not long_opts
+    analyze_btn.disabled   = not long_opts
 
 def on_table_edit(event):
     row = event.row
@@ -609,8 +982,9 @@ def load_file(fp):
     _file_dir    = os.path.dirname(os.path.abspath(fp))
     _file_stem   = os.path.splitext(os.path.basename(fp))[0]
 
-    folder_input.value    = _file_dir
-    out_dir_input.value   = _file_dir
+    # sync browsers to file's directory
+    _refresh_in_nav(_file_dir)
+    _refresh_out_nav(_file_dir)
 
     _tag_mode    = 'cycle'
     _block_tubes = 4
@@ -625,6 +999,11 @@ def load_file(fp):
     for btn in (plot_btn, dist_btn, export_btn, save_plots_btn, clear_plots_btn, delete_btn):
         btn.disabled = False
 
+    single_plot_section.visible = False
+    single_plot_section.objects = []
+    analysis_section.visible    = False
+    analysis_section.objects    = []
+    analysis_status.object      = ''
     on_clear_plots(None)
 
     # ── Build GWY section ─────────────────────────────────────────────────────
@@ -716,11 +1095,15 @@ def load_file(fp):
 
 
 def on_load_file(_event):
-    sel = file_select.value
-    if not sel or sel.startswith('('):
-        load_status.object = '<span style="color:orange">⚠ Select a valid file first.</span>'
+    sel = in_nav_list.value
+    if not sel or sel[0] == '(empty)':
+        load_status.object = '<span style="color:orange">⚠ Select a file from the list.</span>'
         return
-    fp = os.path.join(folder_input.value.strip(), sel)
+    item = sel[0]
+    if not item.startswith('📄 '):
+        load_status.object = '<span style="color:orange">⚠ Select a file (📄), not a folder.</span>'
+        return
+    fp = os.path.join(_in_nav_dir[0], item[2:])
     try:
         load_file(fp)
     except Exception as exc:
@@ -854,7 +1237,7 @@ dist_btn.on_click(on_dist)
 # ── Export CSV ─────────────────────────────────────────────────────────────────
 
 def on_export(_event):
-    out = os.path.join(out_dir_input.value.strip() or _file_dir, _file_stem + '_tagged_profiles.csv')
+    out = os.path.join(_out_dir[0], _file_stem + '_tagged_profiles.csv')
     with open(out, 'w', newline='') as f:
         w = csv.writer(f)
         w.writerow(['line_index', 'bnnt', 'tag', 'distance_um', 'height_nm'])
@@ -893,11 +1276,11 @@ def on_save_plots(_event):
         )
         return
     saved = []
-    _out_dir = out_dir_input.value.strip() or _file_dir
+    _out = _out_dir[0]
 
     for tag, entries in _profile_data:
         slug = tag.replace(' ', '_')
-        out  = os.path.join(_out_dir, f'{_file_stem}_profile_{slug}.png')
+        out  = os.path.join(_out, f'{_file_stem}_profile_{slug}.png')
         fig, ax = plt.subplots(figsize=(6, 4))
         for j, (bnnt, d, p) in enumerate(entries):
             ax.plot(d, p, color=PLOT_COLORS[j % len(PLOT_COLORS)],
@@ -914,7 +1297,7 @@ def on_save_plots(_event):
 
     for tag, values, x_label, n_bins in _dist_data:
         slug = tag.replace(' ', '_')
-        out  = os.path.join(_out_dir, f'{_file_stem}_dist_{slug}.png')
+        out  = os.path.join(_out, f'{_file_stem}_dist_{slug}.png')
         hist, edges = np.histogram(values, bins=n_bins)
         fig, ax = plt.subplots(figsize=(6, 4))
         ax.bar(edges[:-1], hist, width=np.diff(edges), align='edge',
@@ -942,19 +1325,32 @@ save_plots_btn.on_click(on_save_plots)
 # ── Layout assembly ────────────────────────────────────────────────────────────
 
 file_browser_section = pn.Card(
-    pn.Row(folder_input, folder_status,
-           pn.Column(pn.Spacer(height=20), refresh_btn),
-           sizing_mode='stretch_width', align='end'),
+    in_nav_path_html,
     pn.Spacer(height=4),
-    pn.Row(file_select,
-           pn.Column(pn.Spacer(height=20), load_btn),
+    in_nav_list,
+    pn.Spacer(height=4),
+    pn.Row(in_nav_up_btn, pn.Spacer(width=6), in_nav_enter_btn,
            sizing_mode='stretch_width'),
+    pn.Spacer(height=6),
+    load_btn,
     pn.Spacer(height=4),
     load_status,
-    pn.Spacer(height=6),
-    pn.Row(out_dir_input, out_dir_status, sizing_mode='stretch_width', align='end'),
     title='📂  File',
     collapsible=False,
+    header_background='#f5f5f5',
+    styles={'border': '1px solid #e0e0e0'},
+    sizing_mode='stretch_width',
+)
+
+out_dir_section = pn.Card(
+    out_dir_path_html,
+    pn.Spacer(height=4),
+    out_dir_sublist,
+    pn.Spacer(height=4),
+    pn.Row(out_nav_up_btn, pn.Spacer(width=6), out_nav_enter_btn,
+           sizing_mode='stretch_width'),
+    title='📁  Output folder',
+    collapsible=True,
     header_background='#f5f5f5',
     styles={'border': '1px solid #e0e0e0'},
     sizing_mode='stretch_width',
@@ -990,6 +1386,9 @@ action_row = pn.Column(
         clear_plots_btn,
         sizing_mode='stretch_width', max_width=760,
     ),
+    pn.Spacer(height=8),
+    pn.Row(single_select, pn.Spacer(width=6), plot_single_btn,
+           sizing_mode='stretch_width', max_width=760, align='end'),
 )
 
 output_section = pn.Column(
@@ -997,6 +1396,9 @@ output_section = pn.Column(
     action_row,
     save_status,
     pn.Spacer(height=16),
+    single_plot_section,
+    analysis_section,
+    pn.Spacer(height=8),
     profiles_header,
     profiles_col,
     pn.Spacer(height=16),
@@ -1012,10 +1414,30 @@ if _cli_abs:
     except Exception as exc:
         load_status.object = f'<span style="color:red">✗ {exc}</span>'
 
+analysis_card = pn.Card(
+    long_select,
+    pn.Spacer(height=4),
+    baseline_pct_input,
+    prominence_pct_input,
+    min_dist_input,
+    pn.Spacer(height=4),
+    analyze_btn,
+    analysis_status,
+    title='📈  Longitudinal Analysis',
+    collapsible=True,
+    header_background='#f5f5f5',
+    styles={'border': '1px solid #e0e0e0'},
+    sizing_mode='stretch_width',
+)
+
 controls_col = pn.Column(
     file_browser_section,
     pn.Spacer(height=8),
+    out_dir_section,
+    pn.Spacer(height=8),
     cycle_card,
+    pn.Spacer(height=8),
+    analysis_card,
     pn.Spacer(height=8),
     table_section,
     width=360,

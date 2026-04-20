@@ -18,7 +18,7 @@ A Panel-based GUI for tagging boron nitride nanotube (BNNT) height profiles extr
 ### Option 1 — pip from GitHub (recommended)
 
 ```bash
-pip install git+https://github.com/YOUR_USERNAME/bnnt-tagger.git
+pip install git+https://github.com/crisavp/bnnt-tagger.git
 ```
 
 Then launch from anywhere:
@@ -30,7 +30,7 @@ bnnt-tagger
 ### Option 2 — conda environment
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/bnnt-tagger.git
+git clone https://github.com/crisavp/bnnt-tagger.git
 cd bnnt-tagger
 conda env create -f environment.yml
 conda activate bnnt-tagger
@@ -69,9 +69,9 @@ The app opens in your browser at `http://localhost:5006/bnnt_tagger`.
 
 ## Tagging modes
 
-| Mode | Pattern |
-|------|---------|
-| **Cycle** | Repeating sequence: `longitudinal, cross_1, cross_2, cross_3, longitudinal, …` |
+| Mode      | Pattern                                                                                      |
+| --------- | -------------------------------------------------------------------------------------------- |
+| **Cycle** | Repeating sequence: `longitudinal, cross_1, cross_2, cross_3, longitudinal, …`               |
 | **Block** | All longitudinals first (one per tube), then cross groups: `L1, L2, L3, L4, S1₁S2₁S3₁, S1₂…` |
 
 ## Requirements
