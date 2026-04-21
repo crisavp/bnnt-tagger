@@ -10,7 +10,8 @@ Run with:
     panel serve --show bnnt_tagger.py --args path/to/file.txt
 """
 
-import sys, os, csv, re
+import sys, os, csv, re, io
+from collections import defaultdict
 import numpy as np
 import pandas as pd
 from scipy.ndimage import map_coordinates
@@ -21,8 +22,9 @@ import panel as pn
 from bokeh.plotting import figure
 from bokeh.models import (
     ColumnDataSource, ColorBar, LinearColorMapper,
-    Range1d, Label, HoverTool,
+    Range1d, Label, HoverTool, TapTool, Line as BokehLine,
 )
+from bokeh.events import Tap
 from bokeh.palettes import Inferno256
 import matplotlib
 matplotlib.use('Agg')
@@ -162,29 +164,19 @@ def compute_metric(tag, distances, heights):
     return float(d[-1]) * 1000 if tag == 'longitudinal' else float(np.max(h))
 
 
-def analyze_longitudinal(prof_idx, baseline_pct, prominence_pct, min_dist):
-    """
-    Detect peaks and valleys in a longitudinal profile.
-    Returns corrected profile (baseline shifted to 0) plus peak/valley info.
-    """
-    d, h    = profiles[prof_idx]
-    d_nm    = np.array(d) * 1000        # µm → nm
+def _analyze_longitudinal_data(d, h, baseline_pct, prominence_pct, min_dist):
+    """Core peak/valley detection — operates on raw (d_µm, h_nm) arrays."""
+    d_nm    = np.array(d) * 1000
     h_arr   = np.array(h)
-
-    # Baseline: minimum or percentile
     baseline = (float(np.percentile(h_arr, baseline_pct))
                 if baseline_pct > 0 else float(h_arr.min()))
     h_corr  = h_arr - baseline
     h_range = float(h_corr.max()) - float(h_corr.min())
-
     prom     = max(0.0, prominence_pct / 100.0 * h_range)
     dist_arg = max(1, int(min_dist))
-
     pk_idx, pk_props = find_peaks(h_corr, prominence=prom, distance=dist_arg)
-    # valleys = peaks on inverted signal; use half the peak prominence
     vl_idx, vl_props = find_peaks(-h_corr, prominence=max(0.0, prom * 0.5),
                                   distance=dist_arg)
-
     peaks = dict(
         pos        = d_nm[pk_idx].tolist(),
         height     = h_corr[pk_idx].tolist(),
@@ -198,11 +190,96 @@ def analyze_longitudinal(prof_idx, baseline_pct, prominence_pct, min_dist):
     return d_nm.tolist(), h_corr.tolist(), baseline, peaks, valleys
 
 
+def analyze_longitudinal(prof_idx, baseline_pct, prominence_pct, min_dist):
+    d, h = profiles[prof_idx]
+    return _analyze_longitudinal_data(d, h, baseline_pct, prominence_pct, min_dist)
+
+
 def arrange_rows(figs, n_cols=2):
     rows = []
     for i in range(0, len(figs), n_cols):
         rows.append(pn.Row(*figs[i:i + n_cols]))
     return pn.Column(*rows) if rows else pn.Column()
+
+
+def _setup_line_tap(pf, srcs):
+    """Register figure-level Tap handler; returns a state dict {key} updated on each tap.
+    srcs: list of (ColumnDataSource, key). Nearest line by normalised distance wins."""
+    state = {'key': None}
+    def _on_tap(event):
+        tap_x, tap_y = event.x, event.y
+        best_key, best_d = None, float('inf')
+        for src, key in srcs:
+            xs = np.array(src.data['x'])
+            ys = np.array(src.data['y'])
+            if not len(xs):
+                continue
+            xr = float(xs.max() - xs.min()) or 1.0
+            yr = float(ys.max() - ys.min()) or 1.0
+            d = float(np.min(np.hypot((xs - tap_x) / xr, (ys - tap_y) / yr)))
+            if d < best_d:
+                best_d, best_key = d, key
+        state['key'] = best_key
+    pf.on_event(Tap, _on_tap)
+    return state
+
+
+def get_session_summary_df():
+    rows = []
+    for entry in _session:
+        for i, (d, p) in enumerate(entry['profiles']):
+            tag    = entry['tags'][i]
+            metric = (float(np.array(d)[-1]) * 1000 if tag == 'longitudinal'
+                      else float(np.max(np.array(p))))
+            rows.append({
+                'filename':     entry['file_stem'],
+                'line_index':   i + 1,
+                'bnnt':         entry['bnnts'][i],
+                'tag':          tag,
+                'metric_nm':    round(metric, 4),
+                'metric_label': 'length_nm' if tag == 'longitudinal' else 'peak_height_nm',
+            })
+    return pd.DataFrame(rows)
+
+
+def get_session_full_df():
+    rows = []
+    for entry in _session:
+        for i, (d, p) in enumerate(entry['profiles']):
+            for dist, ht in zip(d, p):
+                rows.append({
+                    'filename':    entry['file_stem'],
+                    'line_index':  i + 1,
+                    'bnnt':        entry['bnnts'][i],
+                    'tag':         entry['tags'][i],
+                    'distance_um': round(dist, 6),
+                    'height_nm':   round(ht, 4),
+                })
+    return pd.DataFrame(rows)
+
+
+def _csv_download_btn(get_df_fn, filename):
+    def _cb():
+        buf = io.StringIO()
+        get_df_fn().to_csv(buf, index=False)
+        return io.BytesIO(buf.getvalue().encode())
+    return pn.widgets.FileDownload(
+        callback=_cb, filename=filename,
+        label='⬇ CSV', button_type='light',
+        height=26, width=90, embed=False,
+    )
+
+
+def _plot_with_dl(fig, dl_btn, stretch=False, remove_btn=None):
+    kw = {'sizing_mode': 'stretch_width'} if stretch else {}
+    top_items = []
+    if remove_btn is not None:
+        top_items.append(remove_btn)
+    top_items += [pn.Spacer(), dl_btn]
+    return pn.Column(
+        pn.Row(*top_items),
+        pn.pane.Bokeh(fig, **kw),
+    )
 
 
 def auto_tag(n, cyc):
@@ -269,6 +346,7 @@ _file_dir    = os.getcwd()
 _file_stem   = ''
 _tag_mode    = 'cycle'
 _block_tubes = 4
+_session     = []   # list of dicts: {file_stem, filepath, profiles, tags, bnnts}
 
 # GWY data sources — reassigned in load_file for each GWY file
 line_source  = ColumnDataSource(data=dict(
@@ -321,7 +399,11 @@ def _refresh_in_nav(folder=None):
         f'📁 <b>{label}</b></span>'
     )
     items = _get_browser_items(d)
+    parent = os.path.dirname(d)
+    if parent and parent != d:
+        items = ['..'] + items
     in_nav_list.options = items if items else ['(empty)']
+    in_nav_list.value   = []
 
 def _on_in_up(_event):
     parent = os.path.dirname(_in_nav_dir[0])
@@ -333,13 +415,28 @@ def _on_in_enter(_event):
     if not sel or sel[0] == '(empty)':
         return
     item = sel[0]
-    if item.startswith('📁 '):
+    if item == '..':
+        _on_in_up(None)
+    elif item.startswith('📁 '):
+        new = os.path.join(_in_nav_dir[0], item[2:])
+        if os.path.isdir(new):
+            _refresh_in_nav(new)
+
+def _on_in_select(event):
+    sel = event.new
+    if not sel:
+        return
+    item = sel[0]
+    if item == '..':
+        _on_in_up(None)
+    elif item.startswith('📁 '):
         new = os.path.join(_in_nav_dir[0], item[2:])
         if os.path.isdir(new):
             _refresh_in_nav(new)
 
 in_nav_up_btn.on_click(_on_in_up)
 in_nav_enter_btn.on_click(_on_in_enter)
+in_nav_list.param.watch(_on_in_select, 'value')
 _refresh_in_nav()
 
 load_btn = pn.widgets.Button(
@@ -378,7 +475,11 @@ def _refresh_out_nav(folder=None):
         f'📁 <b>{label}</b></span>'
     )
     subdirs = _get_subdirs(d)
+    parent = os.path.dirname(d)
+    if parent and parent != d:
+        subdirs = ['..'] + subdirs
     out_dir_sublist.options = subdirs if subdirs else ['(no subdirectories)']
+    out_dir_sublist.value   = []
 
 def _on_out_up(_event):
     parent = os.path.dirname(_out_dir[0])
@@ -387,13 +488,31 @@ def _on_out_up(_event):
 
 def _on_out_enter(_event):
     sel = out_dir_sublist.value
-    if sel and sel[0] != '(no subdirectories)':
-        new = os.path.join(_out_dir[0], sel[0])
+    if not sel or sel[0] == '(no subdirectories)':
+        return
+    item = sel[0]
+    if item == '..':
+        _on_out_up(None)
+    else:
+        new = os.path.join(_out_dir[0], item)
+        if os.path.isdir(new):
+            _refresh_out_nav(new)
+
+def _on_out_select(event):
+    sel = event.new
+    if not sel:
+        return
+    item = sel[0]
+    if item == '..':
+        _on_out_up(None)
+    elif item != '(no subdirectories)':
+        new = os.path.join(_out_dir[0], item)
         if os.path.isdir(new):
             _refresh_out_nav(new)
 
 out_nav_up_btn.on_click(_on_out_up)
 out_nav_enter_btn.on_click(_on_out_enter)
+out_dir_sublist.param.watch(_on_out_select, 'value')
 _refresh_out_nav()
 
 # ── GWY helper functions ───────────────────────────────────────────────────────
@@ -560,7 +679,6 @@ export_btn      = pn.widgets.Button(name='⬇  Export CSV',       button_type='d
 save_plots_btn  = pn.widgets.Button(name='💾  Save plots (PNG)', button_type='default', disabled=True, **_BTN)
 clear_plots_btn = pn.widgets.Button(name='✕  Clear plots',      button_type='danger',  disabled=True, **_BTN)
 legend_toggle   = pn.widgets.Toggle(name='Legends: ON', value=True, button_type='default', height=30, width=150)
-dist_bins_input = pn.widgets.TextInput(name='', placeholder='bins (auto)', value='', width=100, height=30)
 
 save_status = pn.pane.HTML('', width=900)
 
@@ -569,10 +687,69 @@ profiles_col    = pn.Column()
 dist_header     = pn.pane.HTML('', width=1000)
 dist_col        = pn.Column()
 
-_profile_figs = []
-_dist_figs    = []
-_profile_data = []
+_profile_figs         = []
+_dist_figs            = []
+_profile_data         = []
+_session_profile_figs = []
+_sf_tap_selected   = {}   # id(src) -> global_profile_idx
+_sess_tap_selected = {}   # id(src) -> (entry_idx, prof_idx)
 _dist_data    = []
+
+# ── Session widgets ────────────────────────────────────────────────────────────
+
+session_status_html = pn.pane.HTML(
+    '<span style="color:#aaa;font-size:12px">No files in session.</span>',
+    sizing_mode='stretch_width',
+)
+session_table = pn.widgets.Tabulator(
+    pd.DataFrame({'File': pd.Series(dtype=str), 'Profiles': pd.Series(dtype=int)}),
+    width=318, height=110, show_index=False, disabled=True,
+    selectable='checkbox',
+)
+session_add_btn    = pn.widgets.Button(
+    name='➕  Add current file', button_type='success',
+    sizing_mode='stretch_width', height=28, disabled=True,
+)
+session_remove_btn = pn.widgets.Button(
+    name='⌫  Remove selected', button_type='warning',
+    sizing_mode='stretch_width', height=28,
+)
+session_clear_btn  = pn.widgets.Button(
+    name='🗑  Clear session', button_type='danger',
+    sizing_mode='stretch_width', height=28,
+)
+session_plot_btn   = pn.widgets.Button(
+    name='▶  Plot all', button_type='success',
+    width=148, height=28, disabled=True,
+)
+session_dist_btn   = pn.widgets.Button(
+    name='📊  Dist all', button_type='primary',
+    width=148, height=28, disabled=True,
+)
+session_export_summary_btn = pn.widgets.FileDownload(
+    callback=lambda: io.BytesIO(get_session_summary_df().to_csv(index=False).encode()),
+    filename='session_summary.csv',
+    label='⬇  Summary CSV', button_type='light',
+    height=26, sizing_mode='stretch_width', embed=False, disabled=True,
+)
+session_export_full_btn = pn.widgets.FileDownload(
+    callback=lambda: io.BytesIO(get_session_full_df().to_csv(index=False).encode()),
+    filename='session_full.csv',
+    label='⬇  Full CSV', button_type='light',
+    height=26, sizing_mode='stretch_width', embed=False, disabled=True,
+)
+session_long_btn = pn.widgets.Button(
+    name='🔍  Analyze longitudinals', button_type='default',
+    sizing_mode='stretch_width', height=28, disabled=True,
+)
+
+# Session output placeholders (main area)
+session_output_header = pn.pane.HTML('', sizing_mode='stretch_width')
+session_profiles_col  = pn.Column()
+session_dist_header   = pn.pane.HTML('', sizing_mode='stretch_width')
+session_dist_col      = pn.Column()
+session_long_header   = pn.pane.HTML('', sizing_mode='stretch_width')
+session_long_col      = pn.Column()
 
 # ── Single profile plot ────────────────────────────────────────────────────────
 
@@ -623,9 +800,13 @@ def on_plot_single(_event):
     pf.line(d_nm, p, line_color=color, line_width=2)
     pf.title.text_font_size = '12px'
     pf.grid.grid_line_alpha = 0.25
+
+    _df = pd.DataFrame({'distance_nm': d_nm, 'height_nm': p})
+    dl  = _csv_download_btn(lambda df=_df: df,
+                            f'profile_{idx+1}_bnnt{bnnt_v}.csv')
     single_plot_section.objects = [
         pn.pane.HTML('<b style="font-size:13px">Single profile:</b>'),
-        pn.pane.Bokeh(pf, sizing_mode='stretch_width'),
+        _plot_with_dl(pf, dl, stretch=True),
     ]
     single_plot_section.visible = True
 
@@ -657,36 +838,62 @@ analysis_status  = pn.pane.HTML('', sizing_mode='stretch_width')
 analysis_section = pn.Column(visible=False, sizing_mode='stretch_width')
 
 
-def _make_dist_fig(vals, color, title, x_label, width=370, height=270):
+def _make_dist_panel(vals, color, title, x_label, n_bins_init,
+                     dl_btn=None, width=370, height=270, fill_alpha=0.75):
     arr = np.array(vals)
     if arr.size == 0:
         return None
-    n_b = max(5, int(np.ceil(np.log2(len(arr))) + 1))
+    n_b  = max(2, n_bins_init)
     hist, edges = np.histogram(arr, bins=n_b)
     xpad = (edges[-1] - edges[0]) * 0.08 if edges[-1] != edges[0] else 0.5
-    df = figure(
+
+    source = ColumnDataSource(data=dict(
+        top=hist.tolist(), bottom=[0] * len(hist),
+        left=edges[:-1].tolist(), right=edges[1:].tolist(),
+    ))
+    pf = figure(
         width=width, height=height, title=title,
         x_axis_label=x_label, y_axis_label='Count',
         x_range=Range1d(edges[0] - xpad, edges[-1] + xpad),
         y_range=Range1d(0, float(hist.max()) * 1.20),
         tools='pan,wheel_zoom,reset,save', toolbar_location='above',
     )
-    df.title.text_font_size  = '11px'
-    df.grid.grid_line_alpha  = 0.25
-    df.xgrid.grid_line_color = None
-    df.quad(
-        top=hist.tolist(), bottom=[0] * len(hist),
-        left=edges[:-1].tolist(), right=edges[1:].tolist(),
-        fill_color=color, fill_alpha=0.75,
-        line_color='white', line_width=1,
+    pf.title.text_font_size  = '11px'
+    pf.grid.grid_line_alpha  = 0.25
+    pf.xgrid.grid_line_color = None
+    pf.quad(
+        top='top', bottom='bottom', left='left', right='right', source=source,
+        fill_color=color, fill_alpha=fill_alpha, line_color='white', line_width=1,
     )
-    df.add_layout(Label(
-        x=float(edges[-1]) + xpad * 0.3,
-        y=float(hist.max()) * 1.06,
+    n_lbl = Label(
+        x=float(edges[-1]) + xpad * 0.3, y=float(hist.max()) * 1.06,
         text=f'n = {len(arr)}',
         text_font_size='9pt', text_color='#555', text_align='right',
-    ))
-    return df
+    )
+    pf.add_layout(n_lbl)
+
+    bins_input = pn.widgets.IntInput(value=n_b, start=2, step=1, name='', width=60, height=26)
+
+    def _on_bins(event, src=source, fig=pf, a=arr, lbl=n_lbl):
+        nb = max(2, event.new)
+        h, e = np.histogram(a, bins=nb)
+        src.data = dict(
+            top=h.tolist(), bottom=[0] * len(h),
+            left=e[:-1].tolist(), right=e[1:].tolist(),
+        )
+        fig.y_range.end = float(h.max()) * 1.20
+        lbl.y           = float(h.max()) * 1.06
+
+    bins_input.param.watch(_on_bins, 'value')
+
+    header = [
+        pn.pane.HTML('<span style="font-size:11px;color:#555">Bins:</span>'),
+        bins_input,
+        pn.Spacer(),
+    ]
+    if dl_btn:
+        header.append(dl_btn)
+    return pn.Column(pn.Row(*header, align='center'), pn.pane.Bokeh(pf))
 
 
 def on_analyze(_event):
@@ -755,14 +962,22 @@ def on_analyze(_event):
     )
 
     # ── Individual single-profile distributions ───────────────────────────
-    single_dist_figs = []
-    for vals, color, title in [
-        (peaks['height'],   '#d62728', 'Peak heights — this profile'),
-        (valleys['height'], '#2ca02c', 'Valley heights — this profile'),
+    single_dist_panels = []
+    for vals, color, title, col_name, fname_suffix in [
+        (peaks['height'],   '#d62728', 'Peak heights — this profile',
+         'peak_height_nm',   f'profile_{idx+1}_peak_heights.csv'),
+        (valleys['height'], '#2ca02c', 'Valley heights — this profile',
+         'valley_height_nm', f'profile_{idx+1}_valley_heights.csv'),
     ]:
-        fig = _make_dist_fig(vals, color, title, 'Height above baseline (nm)')
-        if fig:
-            single_dist_figs.append(fig)
+        if not vals:
+            continue
+        n_b  = max(2, int(np.ceil(np.log2(len(vals)) + 1)))
+        dl   = _csv_download_btn(
+            lambda v=vals, c=col_name: pd.DataFrame({c: v}), fname_suffix
+        )
+        panel = _make_dist_panel(vals, color, title, 'Height above baseline (nm)', n_b, dl_btn=dl)
+        if panel is not None:
+            single_dist_panels.append(panel)
 
     # ── Aggregate: all longitudinal profiles ─────────────────────────────
     long_indices = [i for i in range(n_lines) if tags[i] == 'longitudinal']
@@ -777,16 +992,27 @@ def on_analyze(_event):
         all_vl_heights.extend(vl_i['height'])
         all_vl_proms.extend(vl_i['prominence'])
 
-    agg_figs = []
-    for vals, color, title, xlabel in [
-        (all_pk_heights, '#d62728', 'Peak heights — all longitudinals',      'Height above baseline (nm)'),
-        (all_vl_heights, '#2ca02c', 'Valley heights — all longitudinals',    'Height above baseline (nm)'),
-        (all_pk_proms,   '#e07070', 'Peak prominence — all longitudinals',   'Prominence (nm)'),
-        (all_vl_proms,   '#70c070', 'Valley prominence — all longitudinals', 'Prominence (nm)'),
+    agg_panels = []
+    for vals, color, title, xlabel, col_name, fname_suffix in [
+        (all_pk_heights, '#d62728', 'Peak heights — all longitudinals',
+         'Height above baseline (nm)', 'peak_height_nm',    'all_peak_heights.csv'),
+        (all_vl_heights, '#2ca02c', 'Valley heights — all longitudinals',
+         'Height above baseline (nm)', 'valley_height_nm',  'all_valley_heights.csv'),
+        (all_pk_proms,   '#e07070', 'Peak prominence — all longitudinals',
+         'Prominence (nm)',            'peak_prominence_nm', 'all_peak_prominence.csv'),
+        (all_vl_proms,   '#70c070', 'Valley prominence — all longitudinals',
+         'Prominence (nm)',            'valley_prominence_nm','all_valley_prominence.csv'),
     ]:
-        fig = _make_dist_fig(vals, color, title, xlabel)
-        if fig:
-            agg_figs.append(fig)
+        if not vals:
+            continue
+        n_b  = max(2, int(np.ceil(np.log2(len(vals)) + 1)))
+        dl   = _csv_download_btn(
+            lambda v=vals, c=col_name: pd.DataFrame({c: v}),
+            f'{_file_stem}_{fname_suffix}',
+        )
+        panel = _make_dist_panel(vals, color, title, xlabel, n_b, dl_btn=dl)
+        if panel is not None:
+            agg_panels.append(panel)
 
     n_long = len(long_indices)
     analysis_status.object = (
@@ -796,34 +1022,51 @@ def on_analyze(_event):
         f'<b>{len(all_pk_heights)} peaks</b>, <b>{len(all_vl_heights)} valleys</b></span>'
     )
 
+    # ── Profile plot download ─────────────────────────────────────────────
+    _prof_df = pd.DataFrame({'distance_nm': d_nm, 'height_corr_nm': h_corr})
+    prof_dl  = _csv_download_btn(lambda df=_prof_df: df,
+                                 f'profile_{idx+1}_longitudinal_corrected.csv')
+
+    # ── Peak/valley table download ────────────────────────────────────────
+    pk_dl = _csv_download_btn(lambda df=pk_df: df,
+                              f'profile_{idx+1}_peaks.csv')
+    vl_dl = _csv_download_btn(lambda df=vl_df: df,
+                              f'profile_{idx+1}_valleys.csv')
+
     section_objects = [
         pn.pane.HTML('<hr style="border-color:#e0e0e0;margin:8px 0">'),
         pn.pane.HTML('<b style="font-size:13px">Longitudinal peak/valley analysis</b>'),
         pn.Spacer(height=6),
-        pn.pane.Bokeh(pf, sizing_mode='stretch_width'),
+        _plot_with_dl(pf, prof_dl, stretch=True),
         pn.Spacer(height=10),
         pn.Row(
-            pn.Column(pn.pane.HTML(
-                '<b style="font-size:12px;color:#d62728">▲ Peaks</b>'), pk_table),
+            pn.Column(
+                pn.Row(pn.pane.HTML('<b style="font-size:12px;color:#d62728">▲ Peaks</b>'),
+                       pn.Spacer(), pk_dl),
+                pk_table,
+            ),
             pn.Spacer(width=20),
-            pn.Column(pn.pane.HTML(
-                '<b style="font-size:12px;color:#2ca02c">▼ Valleys</b>'), vl_table),
+            pn.Column(
+                pn.Row(pn.pane.HTML('<b style="font-size:12px;color:#2ca02c">▼ Valleys</b>'),
+                       pn.Spacer(), vl_dl),
+                vl_table,
+            ),
         ),
     ]
-    if single_dist_figs:
+    if single_dist_panels:
         section_objects += [
             pn.Spacer(height=10),
             pn.pane.HTML('<b style="font-size:12px">Distributions — selected profile</b>'),
-            pn.Row(*[pn.pane.Bokeh(f) for f in single_dist_figs]),
+            pn.Row(*single_dist_panels),
         ]
-    if agg_figs:
+    if agg_panels:
         section_objects += [
             pn.Spacer(height=14),
             pn.pane.HTML(
                 f'<b style="font-size:12px">Distributions — all {n_long} longitudinal profiles</b>'
             ),
-            pn.Row(*[pn.pane.Bokeh(f) for f in agg_figs[:2]]),
-            pn.Row(*[pn.pane.Bokeh(f) for f in agg_figs[2:]]),
+            pn.Row(*agg_panels[:2]),
+            pn.Row(*agg_panels[2:]),
         ]
 
     analysis_section.objects = section_objects
@@ -897,27 +1140,10 @@ def update_profile_table():
     long_select.disabled   = not long_opts
     analyze_btn.disabled   = not long_opts
 
-def on_table_edit(event):
-    row = event.row
-    col = event.column
-    val = event.value
-    if col == 'Tag' and row < n_lines:
-        tags[row] = val
-    elif col == 'BNNT' and row < n_lines:
-        bnnts[row] = int(val) if val else 1
-    if is_gwy and n_lines > 0:
-        line_source.data  = build_line_data()
-        label_source.data = build_label_data()
-    update_profile_table()
-
-profile_table.on_edit(on_table_edit)
-
-def on_delete(_event):
-    global profiles, tags, bnnts, n_lines, selected_idx, lines
-    sel = sorted(profile_table.selection, reverse=True)
-    if not sel:
-        return
-    for i in sel:
+def _do_remove_profiles(sorted_desc_indices):
+    """Remove profiles at the given indices (sorted descending). Updates all dependent state."""
+    global n_lines
+    for i in sorted_desc_indices:
         if i < len(profiles):
             profiles.pop(i)
             tags.pop(i)
@@ -936,6 +1162,28 @@ def on_delete(_event):
     update_profile_table()
     profile_table.selection = []
 
+
+def on_table_edit(event):
+    row = event.row
+    col = event.column
+    val = event.value
+    if col == 'Tag' and row < n_lines:
+        tags[row] = val
+    elif col == 'BNNT' and row < n_lines:
+        bnnts[row] = int(val) if val else 1
+    if is_gwy and n_lines > 0:
+        line_source.data  = build_line_data()
+        label_source.data = build_label_data()
+    update_profile_table()
+
+profile_table.on_edit(on_table_edit)
+
+def on_delete(_event):
+    sel = sorted(profile_table.selection, reverse=True)
+    if not sel:
+        return
+    _do_remove_profiles(sel)
+
 delete_btn.on_click(on_delete)
 
 # Placeholder — filled with image + tag-editor for GWY files
@@ -945,7 +1193,7 @@ gwy_section = pn.Column()
 
 def on_legend_toggle(event):
     legend_toggle.name = 'Legends: ON' if event.new else 'Legends: OFF'
-    for pf in _profile_figs:
+    for pf in _profile_figs + _session_profile_figs:
         for lg in pf.legend:
             lg.visible = event.new
 
@@ -998,6 +1246,7 @@ def load_file(fp):
 
     for btn in (plot_btn, dist_btn, export_btn, save_plots_btn, clear_plots_btn, delete_btn):
         btn.disabled = False
+    session_add_btn.disabled = False
 
     single_plot_section.visible = False
     single_plot_section.objects = []
@@ -1114,11 +1363,13 @@ load_btn.on_click(on_load_file)
 # ── Plot profiles ──────────────────────────────────────────────────────────────
 
 def on_plot(_event):
-    global _profile_figs, _profile_data
-    groups = {t: [] for t in cycle}
+    global _profile_figs, _profile_data, _sf_tap_selected
+    _sf_tap_selected = {}
+    plot_tags = ['longitudinal'] + [t for t in cycle if t != 'longitudinal']
+    groups = {t: [] for t in plot_tags}
     for i, (d, p) in enumerate(profiles):
         if tags[i] in groups:
-            groups[tags[i]].append((bnnts[i], i + 1, d, p))
+            groups[tags[i]].append((bnnts[i], i, d, p))
 
     active = [(t, e) for t, e in groups.items() if e]
     if not active:
@@ -1126,24 +1377,48 @@ def on_plot(_event):
         return
 
     figs = []
+    profile_data_entries = []
+    rm_btns = []
     for tag, entries in active:
+        is_cross = (tag != 'longitudinal')
+        x_label  = 'Distance from peak (nm)' if is_cross else 'Distance (nm)'
         pf = figure(
             width=500, height=360,
             title=tag.replace('_', ' ').capitalize(),
-            x_axis_label='Distance (nm)',
+            x_axis_label=x_label,
             y_axis_label='Height (nm)',
-            tools='pan,wheel_zoom,reset,save',
+            tools='pan,wheel_zoom,tap,reset,save',
             toolbar_location='above',
         )
         pf.title.text_color     = '#000000'
         pf.title.text_font_size = '12px'
         pf.grid.grid_line_alpha = 0.25
-        for j, (bnnt, _lidx, d, p) in enumerate(sorted(entries)):
+        tag_entry_data = []
+        fig_src_ids = []
+        fig_srcs = []
+        for j, (bnnt, global_idx, d, p) in enumerate(sorted(entries)):
             d_plot = [x * 1000 for x in d]
-            pf.line(d_plot, p,
-                    line_color=PLOT_COLORS[j % len(PLOT_COLORS)],
-                    line_width=1.6,
-                    legend_label=f'BNNT {bnnt}')
+            if is_cross:
+                peak_pos = d_plot[int(np.argmax(np.array(p)))]
+                d_plot   = [x - peak_pos for x in d_plot]
+            color = PLOT_COLORS[j % len(PLOT_COLORS)]
+            label = f'BNNT {bnnt}'
+            src = ColumnDataSource({'x': d_plot, 'y': list(p),
+                                    'label': [label] * len(d_plot)})
+            renderer = pf.line('x', 'y', source=src,
+                               line_color=color, line_width=1.6,
+                               legend_label=label)
+            renderer.selection_glyph    = BokehLine(line_color=color, line_width=3.0, line_alpha=1.0)
+            renderer.nonselection_glyph = BokehLine(line_color=color, line_width=1.6, line_alpha=0.2)
+            fig_srcs.append((src, global_idx))
+            tag_entry_data.append((bnnt, d_plot, list(p)))
+        tap_state = _setup_line_tap(pf, fig_srcs)
+        pf.add_tools(HoverTool(
+            tooltips=[('Profile', '@label'),
+                      ('Distance', '@x{0.0} nm'),
+                      ('Height',   '@y{0.000} nm')],
+            mode='mouse',
+        ))
         pf.legend.label_text_font_size = '7pt'
         pf.legend.glyph_height         = 10
         pf.legend.glyph_width          = 12
@@ -1151,12 +1426,33 @@ def on_plot(_event):
         pf.legend.location             = 'top_right'
         pf.legend.visible              = legend_toggle.value
         figs.append(pf)
+        profile_data_entries.append((tag, tag_entry_data))
 
-    _profile_figs         = figs
-    _profile_data         = [(tag, [(b, [x * 1000 for x in d], p)
-                                    for b, _, d, p in sorted(entries)])
-                              for tag, entries in active]
-    profiles_col.objects  = arrange_rows(figs, n_cols=2).objects
+        rm_btn = pn.widgets.Button(name='✕ Remove', button_type='danger',
+                                   height=22, width=80)
+        def _make_rm_cb(st):
+            def _cb(_event):
+                idx = st['key']
+                if idx is None:
+                    return
+                _do_remove_profiles([idx])
+                on_plot(None)
+            return _cb
+        rm_btn.on_click(_make_rm_cb(tap_state))
+        rm_btns.append(rm_btn)
+
+    _profile_figs = figs
+    _profile_data = profile_data_entries
+    panels = []
+    for pf, (tag, entries_data), rm_btn in zip(figs, _profile_data, rm_btns):
+        rows_list = []
+        for bnnt, d_nm_l, heights in entries_data:
+            for d, h in zip(d_nm_l, heights):
+                rows_list.append({'bnnt': bnnt, 'distance_nm': round(d, 4), 'height_nm': round(h, 4)})
+        _df  = pd.DataFrame(rows_list)
+        dl   = _csv_download_btn(lambda df=_df: df, f'{_file_stem}_{tag}_profiles.csv')
+        panels.append(_plot_with_dl(pf, dl, remove_btn=rm_btn))
+    profiles_col.objects   = arrange_rows(panels, n_cols=2).objects
     profiles_header.object = '<b style="font-size:13px">Grouped profiles:</b>'
 
 plot_btn.on_click(on_plot)
@@ -1165,7 +1461,9 @@ plot_btn.on_click(on_plot)
 
 def on_dist(_event):
     global _dist_figs, _dist_data
-    groups = {t: [] for t in cycle}
+    # Always include longitudinal regardless of what is in the cross cycle
+    plot_tags = ['longitudinal'] + [t for t in cycle if t != 'longitudinal']
+    groups = {t: [] for t in plot_tags}
     for i, (d, p) in enumerate(profiles):
         if tags[i] in groups:
             metric = compute_metric(tags[i], d, p)
@@ -1176,60 +1474,27 @@ def on_dist(_event):
         dist_header.object = '<span style="color:red">No tagged profiles for distribution.</span>'
         return
 
-    try:
-        user_bins = int(dist_bins_input.value.strip())
-        if user_bins < 1:
-            raise ValueError
-    except (ValueError, AttributeError):
-        user_bins = None
-
-    figs = []
+    _dist_figs = []
+    _dist_data = []
+    panels = []
     for tag, entries in active:
         values  = np.array([v for _, v in entries])
         x_label = 'Length (nm)' if tag == 'longitudinal' else 'Peak height (nm)'
-        n_bins  = (user_bins if user_bins is not None
-                   else max(5, int(np.ceil(np.log2(len(values))) + 1)))
-        hist, edges = np.histogram(values, bins=n_bins)
-
-        xpad = (edges[-1] - edges[0]) * 0.08
-        pf = figure(
-            width=500, height=340,
-            title=tag.replace('_', ' ').capitalize(),
-            x_axis_label=x_label,
-            y_axis_label='Count',
-            x_range=Range1d(edges[0] - xpad, edges[-1] + xpad),
-            y_range=Range1d(0, float(hist.max()) * 1.18),
-            tools='pan,wheel_zoom,reset,save',
-            toolbar_location='above',
+        n_bins  = max(5, int(np.ceil(np.log2(len(values))) + 1))
+        col_name = x_label.lower().replace(' ', '_').replace('(', '').replace(')', '')
+        _df = pd.DataFrame({col_name: values})
+        dl  = _csv_download_btn(lambda df=_df: df, f'{_file_stem}_{tag}_distribution.csv')
+        panel = _make_dist_panel(
+            values, HIST_COLOR,
+            tag.replace('_', ' ').capitalize(),
+            x_label, n_bins,
+            dl_btn=dl, width=500, height=340, fill_alpha=0.85,
         )
-        pf.title.text_color      = '#000000'
-        pf.title.text_font_size  = '12px'
-        pf.grid.grid_line_alpha  = 0.25
-        pf.grid.grid_line_color  = '#cccccc'
-        pf.xgrid.grid_line_color = None
+        if panel is not None:
+            panels.append(panel)
+            _dist_data.append((tag, values, x_label, n_bins))
 
-        pf.quad(
-            top=hist.tolist(), bottom=[0] * len(hist),
-            left=edges[:-1].tolist(), right=edges[1:].tolist(),
-            fill_color=HIST_COLOR, fill_alpha=0.85,
-            line_color='white', line_width=1.2,
-        )
-        pf.add_layout(Label(
-            x=float(edges[-1]) + xpad * 0.3,
-            y=float(hist.max()) * 1.05,
-            text=f'n = {len(values)}',
-            text_font_size='9pt', text_color='#555',
-            text_align='right',
-        ))
-        figs.append(pf)
-
-    _dist_figs         = figs
-    _dist_data         = [(tag, np.array([v for _, v in entries]),
-                           'Length (nm)' if tag == 'longitudinal' else 'Peak height (nm)',
-                           (user_bins if user_bins is not None
-                            else max(5, int(np.ceil(np.log2(len(entries))) + 1))))
-                          for tag, entries in active]
-    dist_col.objects   = arrange_rows(figs, n_cols=2).objects
+    dist_col.objects   = arrange_rows(panels, n_cols=2).objects
     dist_header.object = '<b style="font-size:13px">Distributions:</b>'
 
 dist_btn.on_click(on_dist)
@@ -1266,6 +1531,321 @@ def on_clear_plots(_event):
 
 clear_plots_btn.on_click(on_clear_plots)
 
+# ── Session callbacks ──────────────────────────────────────────────────────────
+
+def update_session_table():
+    has = len(_session) > 0
+    session_table.value = pd.DataFrame({
+        'File':     [e['file_stem']        for e in _session],
+        'Profiles': [len(e['profiles'])    for e in _session],
+    })
+    if has:
+        session_status_html.object = (
+            f'<span style="font-size:12px;color:#333">'
+            f'<b>{len(_session)}</b> file(s) in session</span>'
+        )
+    else:
+        session_status_html.object = (
+            '<span style="color:#aaa;font-size:12px">No files in session.</span>'
+        )
+    for w in (session_plot_btn, session_dist_btn, session_long_btn,
+              session_export_summary_btn, session_export_full_btn):
+        w.disabled = not has
+
+
+def on_session_add(_event):
+    if not profiles:
+        return
+    # Replace entry if the same file_stem is already present
+    for k, e in enumerate(_session):
+        if e['file_stem'] == _file_stem:
+            _session[k] = dict(
+                file_stem=_file_stem, filepath=filepath,
+                profiles=[tuple(p) for p in profiles],
+                tags=list(tags), bnnts=list(bnnts),
+            )
+            update_session_table()
+            session_status_html.object = (
+                f'<span style="color:#e07800;font-size:12px">'
+                f'↺ Updated <b>{_file_stem}</b> in session.</span>'
+            )
+            return
+    _session.append(dict(
+        file_stem=_file_stem, filepath=filepath,
+        profiles=[tuple(p) for p in profiles],
+        tags=list(tags), bnnts=list(bnnts),
+    ))
+    update_session_table()
+    session_status_html.object = (
+        f'<span style="color:green;font-size:12px">'
+        f'✔ Added <b>{_file_stem}</b> ({len(profiles)} profiles).</span>'
+    )
+
+
+def on_session_remove(_event):
+    sel = sorted(session_table.selection, reverse=True)
+    for i in sel:
+        if i < len(_session):
+            _session.pop(i)
+    session_table.selection = []
+    update_session_table()
+
+
+def on_session_clear(_event):
+    _session.clear()
+    session_table.selection = []
+    update_session_table()
+    session_output_header.object = ''
+    session_profiles_col.objects = []
+    session_dist_header.object   = ''
+    session_dist_col.objects     = []
+    session_long_header.object   = ''
+    session_long_col.objects     = []
+
+
+def on_session_plot(_event):
+    global _session_profile_figs, _sess_tap_selected
+    if not _session:
+        return
+    _session_profile_figs = []
+    _sess_tap_selected = {}
+    # Collect all (file_stem, bnnt) pairs for color assignment
+    all_pairs = []
+    for entry in _session:
+        for b in sorted(set(entry['bnnts'])):
+            pair = (entry['file_stem'], b)
+            if pair not in all_pairs:
+                all_pairs.append(pair)
+    color_map = {pair: PLOT_COLORS[i % len(PLOT_COLORS)]
+                 for i, pair in enumerate(all_pairs)}
+
+    # Build per-tag groups across all session entries
+    tag_set = ['longitudinal']
+    for entry in _session:
+        for t in entry['tags']:
+            if t not in tag_set:
+                tag_set.append(t)
+    groups = {t: [] for t in tag_set}
+    for entry_idx, entry in enumerate(_session):
+        for prof_idx, (d, p) in enumerate(entry['profiles']):
+            t = entry['tags'][prof_idx]
+            if t in groups:
+                groups[t].append((entry['file_stem'], entry['bnnts'][prof_idx],
+                                  d, p, entry_idx, prof_idx))
+
+    panels = []
+    for tag, entries in groups.items():
+        if not entries:
+            continue
+        is_cross = (tag != 'longitudinal')
+        x_label  = 'Distance from peak (nm)' if is_cross else 'Distance (nm)'
+        pf = figure(
+            width=500, height=360,
+            title=f'{tag.replace("_", " ").capitalize()}  —  {len(_session)} file(s)',
+            x_axis_label=x_label, y_axis_label='Height (nm)',
+            tools='pan,wheel_zoom,tap,reset,save', toolbar_location='above',
+        )
+        pf.title.text_font_size = '12px'
+        pf.grid.grid_line_alpha = 0.25
+        rows_list = []
+        fig_srcs = []
+        for file_stem, bnnt, d, p, entry_idx, prof_idx in entries:
+            d_plot = [x * 1000 for x in d]
+            if is_cross:
+                peak_pos = d_plot[int(np.argmax(np.array(p)))]
+                d_plot   = [x - peak_pos for x in d_plot]
+            color = color_map.get((file_stem, bnnt), PLOT_COLORS[0])
+            label = f'{file_stem} · BNNT {bnnt}'
+            src = ColumnDataSource({'x': d_plot, 'y': list(p),
+                                    'label': [label] * len(d_plot)})
+            renderer = pf.line('x', 'y', source=src, line_color=color, line_width=1.4,
+                               legend_label=label)
+            renderer.selection_glyph    = BokehLine(line_color=color, line_width=3.0, line_alpha=1.0)
+            renderer.nonselection_glyph = BokehLine(line_color=color, line_width=1.4, line_alpha=0.2)
+            fig_srcs.append((src, (entry_idx, prof_idx)))
+            for dist, ht in zip(d_plot, p):
+                rows_list.append({'file': file_stem, 'bnnt': bnnt,
+                                  'distance_nm': round(dist, 4),
+                                  'height_nm': round(ht, 4)})
+        tap_state = _setup_line_tap(pf, fig_srcs)
+        pf.add_tools(HoverTool(
+            tooltips=[('Profile', '@label'),
+                      ('Distance', '@x{0.0} nm'),
+                      ('Height',   '@y{0.000} nm')],
+            mode='mouse',
+        ))
+        pf.legend.label_text_font_size = '7pt'
+        pf.legend.glyph_height         = 10
+        pf.legend.glyph_width          = 12
+        pf.legend.spacing              = 1
+        pf.legend.location             = 'top_right'
+        pf.legend.visible              = legend_toggle.value
+        _session_profile_figs.append(pf)
+
+        rm_btn = pn.widgets.Button(name='✕ Remove', button_type='danger',
+                                   height=22, width=80)
+        def _make_session_rm_cb(st):
+            def _cb(_event):
+                key = st['key']
+                if key is None:
+                    return
+                ei, pi = key
+                _session[ei]['profiles'].pop(pi)
+                _session[ei]['tags'].pop(pi)
+                _session[ei]['bnnts'].pop(pi)
+                _session[:] = [e for e in _session if e['profiles']]
+                update_session_table()
+                on_session_plot(None)
+            return _cb
+        rm_btn.on_click(_make_session_rm_cb(tap_state))
+
+        _df = pd.DataFrame(rows_list)
+        dl  = _csv_download_btn(lambda df=_df: df,
+                                f'session_{tag}_profiles.csv')
+        panels.append(_plot_with_dl(pf, dl, remove_btn=rm_btn))
+
+    session_profiles_col.objects  = arrange_rows(panels, n_cols=2).objects
+    session_output_header.object  = (
+        f'<b style="font-size:13px">Session grouped profiles '
+        f'({len(_session)} file(s)):</b>'
+    )
+
+
+def on_session_dist(_event):
+    if not _session:
+        return
+    tag_set = ['longitudinal']
+    for entry in _session:
+        for t in entry['tags']:
+            if t not in tag_set:
+                tag_set.append(t)
+
+    panels = []
+    for tag in tag_set:
+        metrics = []
+        for entry in _session:
+            for i, (d, p) in enumerate(entry['profiles']):
+                if entry['tags'][i] == tag:
+                    metrics.append(compute_metric(tag, d, p))
+        if not metrics:
+            continue
+        x_label = 'Length (nm)' if tag == 'longitudinal' else 'Peak height (nm)'
+        n_bins  = max(5, int(np.ceil(np.log2(len(metrics))) + 1))
+        title   = (f'{tag.replace("_", " ").capitalize()}  —  '
+                   f'{len(_session)} file(s), n={len(metrics)}')
+        col_name = x_label.lower().replace(' ', '_').replace('(', '').replace(')', '')
+        _df = pd.DataFrame({col_name: metrics})
+        dl  = _csv_download_btn(lambda df=_df: df,
+                                f'session_{tag}_distribution.csv')
+        panel = _make_dist_panel(
+            metrics, HIST_COLOR, title, x_label, n_bins,
+            dl_btn=dl, width=500, height=340, fill_alpha=0.85,
+        )
+        if panel is not None:
+            panels.append(panel)
+
+    session_dist_col.objects   = arrange_rows(panels, n_cols=2).objects
+    session_dist_header.object = (
+        f'<b style="font-size:13px">Session distributions '
+        f'({len(_session)} file(s)):</b>'
+    )
+
+
+def on_session_long_analyze(_event):
+    if not _session:
+        return
+    bpct  = baseline_pct_input.value
+    ppct  = prominence_pct_input.value
+    mdist = min_dist_input.value
+
+    all_pk_heights, all_pk_proms = [], []
+    all_vl_heights, all_vl_proms = [], []
+
+    summary_rows = []
+    for entry in _session:
+        n_long = n_pk = n_vl = 0
+        for i, (d, p) in enumerate(entry['profiles']):
+            if entry['tags'][i] != 'longitudinal':
+                continue
+            n_long += 1
+            _, _, _, pk, vl = _analyze_longitudinal_data(
+                d, p, bpct, ppct, mdist,
+            )
+            all_pk_heights.extend(pk['height'])
+            all_pk_proms.extend(pk['prominence'])
+            all_vl_heights.extend(vl['height'])
+            all_vl_proms.extend(vl['prominence'])
+            n_pk += len(pk['height'])
+            n_vl += len(vl['height'])
+        if n_long:
+            summary_rows.append({
+                'File':         entry['file_stem'],
+                'Longitudinals': n_long,
+                'Peaks':         n_pk,
+                'Valleys':       n_vl,
+            })
+
+    if not summary_rows:
+        session_long_header.object = (
+            '<span style="color:orange">⚠ No longitudinal profiles found in session.</span>'
+        )
+        session_long_col.objects = []
+        return
+
+    # Summary table
+    summary_df    = pd.DataFrame(summary_rows)
+    summary_table = pn.widgets.Tabulator(
+        summary_df, width=560, height=min(30 * len(summary_rows) + 40, 220),
+        show_index=False, disabled=True,
+    )
+    summary_dl = _csv_download_btn(lambda df=summary_df: df,
+                                   'session_longitudinal_summary.csv')
+
+    # Four aggregate histograms
+    panels = []
+    for vals, color, title, xlabel, col_name, fname in [
+        (all_pk_heights, '#d62728', 'Peak heights — all session longitudinals',
+         'Height above baseline (nm)', 'peak_height_nm',    'session_all_peak_heights.csv'),
+        (all_vl_heights, '#2ca02c', 'Valley heights — all session longitudinals',
+         'Height above baseline (nm)', 'valley_height_nm',  'session_all_valley_heights.csv'),
+        (all_pk_proms,   '#e07070', 'Peak prominence — all session longitudinals',
+         'Prominence (nm)',            'peak_prominence_nm', 'session_all_peak_prominence.csv'),
+        (all_vl_proms,   '#70c070', 'Valley prominence — all session longitudinals',
+         'Prominence (nm)',            'valley_prominence_nm','session_all_valley_prominence.csv'),
+    ]:
+        if not vals:
+            continue
+        n_b   = max(2, int(np.ceil(np.log2(len(vals)) + 1)))
+        _df   = pd.DataFrame({col_name: vals})
+        dl    = _csv_download_btn(lambda df=_df: df, fname)
+        panel = _make_dist_panel(vals, color, title, xlabel, n_b, dl_btn=dl)
+        if panel is not None:
+            panels.append(panel)
+
+    total_long = sum(r['Longitudinals'] for r in summary_rows)
+    session_long_header.object = (
+        f'<b style="font-size:13px">Session longitudinal analysis — '
+        f'{len(_session)} file(s), {total_long} longitudinal profile(s) '
+        f'(baseline={bpct}%, prominence={ppct}%, min dist={mdist})</b>'
+    )
+    session_long_col.objects = [
+        pn.Row(
+            pn.pane.HTML('<b style="font-size:12px">Per-file summary:</b>'),
+            pn.Spacer(), summary_dl,
+        ),
+        summary_table,
+        pn.Spacer(height=10),
+        *arrange_rows(panels, n_cols=2).objects,
+    ]
+
+
+session_add_btn.on_click(on_session_add)
+session_remove_btn.on_click(on_session_remove)
+session_clear_btn.on_click(on_session_clear)
+session_plot_btn.on_click(on_session_plot)
+session_dist_btn.on_click(on_session_dist)
+session_long_btn.on_click(on_session_long_analyze)
+
 # ── Save plots (PNG via matplotlib) ───────────────────────────────────────────
 
 def on_save_plots(_event):
@@ -1279,14 +1859,15 @@ def on_save_plots(_event):
     _out = _out_dir[0]
 
     for tag, entries in _profile_data:
-        slug = tag.replace(' ', '_')
-        out  = os.path.join(_out, f'{_file_stem}_profile_{slug}.png')
+        slug    = tag.replace(' ', '_')
+        out     = os.path.join(_out, f'{_file_stem}_profile_{slug}.png')
+        x_label = 'Distance from peak (nm)' if tag != 'longitudinal' else 'Distance (nm)'
         fig, ax = plt.subplots(figsize=(6, 4))
         for j, (bnnt, d, p) in enumerate(entries):
             ax.plot(d, p, color=PLOT_COLORS[j % len(PLOT_COLORS)],
                     linewidth=1.4, label=f'BNNT {bnnt}')
         ax.set_title(tag.replace('_', ' ').capitalize(), fontsize=12)
-        ax.set_xlabel('Distance (nm)')
+        ax.set_xlabel(x_label)
         ax.set_ylabel('Height (nm)')
         ax.grid(alpha=0.25)
         ax.legend(fontsize=7)
@@ -1374,8 +1955,7 @@ action_row = pn.Column(
     pn.Row(
         plot_btn, pn.Spacer(width=6),
         dist_btn, pn.Spacer(width=6),
-        legend_toggle, pn.Spacer(width=6),
-        dist_bins_input,
+        legend_toggle,
         align='center',
         sizing_mode='stretch_width', max_width=760,
     ),
@@ -1404,6 +1984,16 @@ output_section = pn.Column(
     pn.Spacer(height=16),
     dist_header,
     dist_col,
+    pn.Spacer(height=24),
+    pn.pane.HTML('<hr style="border-color:#ccc;margin:4px 0">'),
+    session_output_header,
+    session_profiles_col,
+    pn.Spacer(height=16),
+    session_dist_header,
+    session_dist_col,
+    pn.Spacer(height=16),
+    session_long_header,
+    session_long_col,
     sizing_mode='stretch_width',
 )
 
@@ -1430,10 +2020,33 @@ analysis_card = pn.Card(
     sizing_mode='stretch_width',
 )
 
+session_card = pn.Card(
+    session_status_html,
+    pn.Spacer(height=4),
+    session_table,
+    pn.Spacer(height=4),
+    session_add_btn,
+    pn.Row(session_remove_btn, session_clear_btn),
+    pn.Spacer(height=6),
+    pn.Row(session_plot_btn, session_dist_btn, align='center'),
+    pn.Spacer(height=4),
+    session_long_btn,
+    pn.Spacer(height=4),
+    session_export_summary_btn,
+    session_export_full_btn,
+    title='📋  Session',
+    collapsible=True,
+    header_background='#f5f5f5',
+    styles={'border': '1px solid #e0e0e0'},
+    sizing_mode='stretch_width',
+)
+
 controls_col = pn.Column(
     file_browser_section,
     pn.Spacer(height=8),
     out_dir_section,
+    pn.Spacer(height=8),
+    session_card,
     pn.Spacer(height=8),
     cycle_card,
     pn.Spacer(height=8),
